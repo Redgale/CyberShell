@@ -8,7 +8,7 @@
   <!-- xterm.js — served locally from npm packages -->
   <link rel="stylesheet" href="/xterm/css/xterm.css">
   <script src="/xterm/lib/xterm.js"></script>
-  <script src="/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <script src="/xterm-addon-fit/lib/addon-fit.js"></script>
 
   <!-- Share Tech Mono (cyberpunk mono face) -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -732,7 +732,7 @@ function createTerminal() {
     allowProposedApi: true,
   });
 
-  fitAddon = new FitAddon();
+  fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(terminalEl);
   fitAddon.fit();
@@ -826,29 +826,17 @@ function connect() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    // Build terminal before sending connect so rows/cols are ready
-    createTerminal();
-    showTerminal(`${target.username}@${target.host}:${port}`);
-
-    const dims = term
-      ? { rows: term.rows, cols: term.cols }
-      : { rows: 24, cols: 80 };
-
+    // Keep form visible while SSH handshakes — only show terminal on 'connected'
+    const port = parseInt(inpPort.value, 10) || 22;
     ws.send(JSON.stringify({
       type:     'connect',
       host:     target.host,
       port,
       username: target.username,
       password,
-      ...dims,
+      rows: 24,
+      cols: 80,
     }));
-
-    // Keepalive ping every 25s
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 25_000);
   };
 
   ws.onmessage = (evt) => {
@@ -858,7 +846,19 @@ function connect() {
 
     switch (msg.type) {
       case 'connected':
-        // Already showing terminal; nothing extra needed
+        // SSH handshake confirmed — now build and show the terminal
+        createTerminal();
+        showTerminal(`${target.username}@${target.host}:${parseInt(inpPort.value,10)||22}`);
+        // Send real terminal dimensions now that xterm is rendered
+        if (ws && ws.readyState === WebSocket.OPEN && term) {
+          ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
+        }
+        // Keepalive ping every 25s
+        pingTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25_000);
         break;
 
       case 'data':
@@ -876,10 +876,15 @@ function connect() {
         break;
 
       case 'error':
-        if (term) term.write('\r\n\x1b[31m✗ ' + msg.message + '\x1b[0m\r\n');
-        // If we never connected (no terminal interaction yet), go back to form
-        showConnect('SSH error: ' + msg.message);
+        // If terminal is visible, write to it; otherwise show on form
+        if (!viewTerminal.classList.contains('hidden') && term) {
+          term.write('\r\n\x1b[31m✗ ' + msg.message + '\x1b[0m\r\n');
+          setTimeout(() => showConnect(null), 2500);
+        } else {
+          showConnect('SSH error: ' + msg.message);
+        }
         clearInterval(pingTimer);
+        btnConnect.disabled = false;
         break;
 
       case 'disconnected':
@@ -892,6 +897,7 @@ function connect() {
 
   ws.onerror = () => {
     clearInterval(pingTimer);
+    btnConnect.disabled = false;
     showConnect('WebSocket error — check that the server is running and the certificate is trusted.');
   };
 

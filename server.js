@@ -63,8 +63,8 @@ const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve xterm from local npm packages (no CDN dependency)
-app.use('/xterm',           express.static(path.join(__dirname, 'node_modules/xterm')));
-app.use('/xterm-addon-fit', express.static(path.join(__dirname, 'node_modules/xterm-addon-fit')));
+app.use('/xterm',           express.static(path.join(__dirname, 'node_modules/@xterm/xterm')));
+app.use('/xterm-addon-fit', express.static(path.join(__dirname, 'node_modules/@xterm/addon-fit')));
 
 // Security headers
 app.use((_req, res, next) => {
