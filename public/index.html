@@ -352,6 +352,120 @@
       margin-top: 8px;
     }
 
+    /* ── Scan / discover ── */
+    .target-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+    .target-row .field-group { flex: 1; }
+
+    #btn-scan {
+      flex-shrink: 0;
+      height: 40px;           /* matches input height */
+      padding: 0 12px;
+      background: transparent;
+      border: 1px solid var(--border-bright);
+      color: var(--text-mid);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      cursor: pointer;
+      text-transform: uppercase;
+      white-space: nowrap;
+      transition: border-color var(--transition), color var(--transition), box-shadow var(--transition);
+      border-radius: var(--radius);
+      margin-bottom: 0;        /* align with input */
+    }
+    #btn-scan:hover:not(:disabled) {
+      border-color: var(--red);
+      color: var(--red);
+      box-shadow: 0 0 10px var(--red-glow-soft);
+    }
+    #btn-scan:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Spinning radar icon */
+    .scanning #btn-scan .scan-icon { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .scan-icon { display: inline-block; }
+
+    /* Discovered devices list */
+    #discover-panel {
+      display: none;
+      margin-top: 8px;
+      border: 1px solid var(--border-mid);
+      background: #050001;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    #discover-panel.show { display: block; }
+    #discover-panel::-webkit-scrollbar { width: 4px; }
+    #discover-panel::-webkit-scrollbar-thumb { background: var(--red-dark); }
+
+    .discover-header {
+      padding: 6px 10px;
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .discover-header button {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0 2px;
+      line-height: 1;
+    }
+    .discover-header button:hover { color: var(--red); }
+
+    .device-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      transition: background var(--transition);
+    }
+    .device-item:last-child { border-bottom: none; }
+    .device-item:hover { background: var(--surface2); }
+
+    .device-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green-glow);
+      flex-shrink: 0;
+    }
+    .device-label {
+      font-size: 13px;
+      color: var(--text);
+      flex: 1;
+    }
+    .device-meta {
+      font-size: 11px;
+      color: var(--text-dim);
+      text-align: right;
+    }
+    .device-port {
+      font-size: 10px;
+      color: var(--red-dim);
+      margin-top: 1px;
+    }
+
+    .discover-empty {
+      padding: 14px 10px;
+      font-size: 12px;
+      color: var(--text-dim);
+      text-align: center;
+    }
+
     #btn-connect::before {
       content: '';
       position: absolute;
@@ -592,15 +706,22 @@
       <div class="field-row">
         <div class="field-group">
           <label class="field-label" for="inp-target">Target</label>
-          <input
-            id="inp-target"
-            type="text"
-            placeholder="root@192.168.1.12"
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck="false"
-          >
+          <div class="target-row">
+            <div class="field-group" style="margin-bottom:0">
+              <input
+                id="inp-target"
+                type="text"
+                placeholder="root@pi.local  or  root@192.168.1.12"
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
+              >
+            </div>
+            <button id="btn-scan" type="button" title="Scan local network for SSH devices">
+              <span class="scan-icon">◎</span>&nbsp;SCAN
+            </button>
+          </div>
         </div>
         <div class="field-group">
           <label class="field-label" for="inp-port">Port</label>
@@ -613,6 +734,15 @@
             autocomplete="off"
           >
         </div>
+      </div>
+
+      <!-- Discovered devices (hidden until scan) -->
+      <div id="discover-panel">
+        <div class="discover-header">
+          <span>Discovered devices</span>
+          <button id="btn-close-discover" title="Close">✕</button>
+        </div>
+        <div id="discover-list"></div>
       </div>
 
       <!-- Password -->
@@ -683,6 +813,10 @@ const sessionTarget  = document.getElementById('session-target');
 const pwToggle       = document.getElementById('pw-toggle');
 const terminalEl     = document.getElementById('terminal');
 const termWrap       = document.getElementById('terminal-wrap');
+const btnScan        = document.getElementById('btn-scan');
+const discoverPanel  = document.getElementById('discover-panel');
+const discoverList   = document.getElementById('discover-list');
+const btnCloseDiscover = document.getElementById('btn-close-discover');
 
 // ── State ────────────────────────────────────────────────────
 let ws          = null;
@@ -861,6 +995,16 @@ function connect() {
         }, 25_000);
         break;
 
+      case 'mdns_resolving':
+        setStatus('connecting',
+          `<span class="dot-anim">Resolving <strong>${msg.hostname}</strong> via mDNS</span>`);
+        break;
+
+      case 'mdns_resolved':
+        setStatus('connecting',
+          `<span class="dot-anim">Resolved <strong>${msg.hostname}</strong> → ${msg.ip} — connecting</span>`);
+        break;
+
       case 'data':
         if (term) {
           const raw = atob(msg.data);
@@ -976,6 +1120,71 @@ inpTarget.addEventListener('input', () => {
   if (sshMatch) {
     inpTarget.value = sshMatch[1];
     if (sshMatch[2]) inpPort.value = sshMatch[2];
+  }
+});
+
+// ── Network scan / device discovery ─────────────────────────────────────────
+async function runScan() {
+  btnScan.disabled = true;
+  discoverPanel.classList.remove('show');
+  discoverList.innerHTML = '';
+  document.getElementById('view-connect').classList.add('scanning');
+  btnScan.querySelector('.scan-icon').textContent = '◉';
+
+  try {
+    const res  = await fetch('/api/discover');
+    const data = await res.json();
+
+    if (!data.ok || data.devices.length === 0) {
+      discoverList.innerHTML =
+        `<div class="discover-empty">No SSH devices found on this network.<br>
+         <small>Devices must support mDNS and advertise SSH services.</small></div>`;
+    } else {
+      for (const d of data.devices) {
+        const item = document.createElement('div');
+        item.className = 'device-item';
+        item.innerHTML = `
+          <div class="device-dot"></div>
+          <div class="device-label">${d.label}<br>
+            <span style="font-size:11px;color:var(--text-dim)">${d.hostname}</span>
+          </div>
+          <div class="device-meta">
+            <div>${d.ip}</div>
+            <div class="device-port">:${d.port}</div>
+          </div>`;
+
+        item.addEventListener('click', () => {
+          // Fill in host (keep any existing username prefix)
+          const current = inpTarget.value.trim();
+          const atIdx   = current.indexOf('@');
+          const prefix  = atIdx > 0 ? current.slice(0, atIdx + 1) : '';
+          inpTarget.value = prefix + d.hostname;
+          inpPort.value   = d.port;
+          discoverPanel.classList.remove('show');
+          inpPassword.focus();
+        });
+
+        discoverList.appendChild(item);
+      }
+    }
+
+    discoverPanel.classList.add('show');
+  } catch (err) {
+    setStatus('error', 'Scan failed: ' + err.message);
+  } finally {
+    document.getElementById('view-connect').classList.remove('scanning');
+    btnScan.querySelector('.scan-icon').textContent = '◎';
+    btnScan.disabled = false;
+  }
+}
+
+btnScan.addEventListener('click', runScan);
+btnCloseDiscover.addEventListener('click', () => discoverPanel.classList.remove('show'));
+
+// Hide discover panel when user edits target manually
+inpTarget.addEventListener('focus', () => {
+  if (discoverPanel.classList.contains('show')) {
+    discoverPanel.classList.remove('show');
   }
 });
 

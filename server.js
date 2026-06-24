@@ -5,14 +5,15 @@
 
 'use strict';
 
-const express  = require('express');
-const https    = require('https');
+const express   = require('express');
+const https     = require('https');
 const WebSocket = require('ws');
 const { Client } = require('ssh2');
-const fs       = require('fs');
-const path     = require('path');
-const crypto   = require('crypto');
-const os       = require('os');
+const mDNS      = require('multicast-dns');
+const fs        = require('fs');
+const path      = require('path');
+const crypto    = require('crypto');
+const os        = require('os');
 const { execSync } = require('child_process');
 
 // ─── Configuration ─────────────────────────────────────────────────────────
@@ -110,7 +111,142 @@ setInterval(() => {
   }
 }, 5 * 60_000);
 
-// ─── WebSocket → SSH Bridge ──────────────────────────────────────────────────
+// ─── mDNS Helpers ────────────────────────────────────────────────────────────
+
+const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}$/;
+
+/** True when the host should be resolved via mDNS rather than system DNS */
+function needsMdns(host) {
+  if (IPV4_RE.test(host)) return false;      // plain IPv4 — skip
+  if (host.includes(':'))  return false;      // IPv6     — skip
+  if (host.endsWith('.local')) return true;   // foo.local
+  if (!host.includes('.'))     return true;   // bare name, e.g. "pi"
+  return false;
+}
+
+/**
+ * Resolve a hostname to IPv4 via mDNS (multicast DNS, RFC 6762).
+ * Bare names are automatically suffixed with ".local".
+ */
+function resolveMdns(hostname, timeoutMs = 5000) {
+  const fullName = hostname.endsWith('.local')
+    ? hostname
+    : `${hostname}.local`;
+
+  return new Promise((resolve, reject) => {
+    const m = mDNS();
+    let done = false;
+
+    const finish = (err, ip) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { m.destroy(); } catch {}
+      err ? reject(err) : resolve(ip);
+    };
+
+    const timer = setTimeout(
+      () => finish(new Error(`mDNS: "${fullName}" not found (timeout ${timeoutMs / 1000}s)`)),
+      timeoutMs
+    );
+
+    m.on('response', ({ answers = [], additionals = [] }) => {
+      const aRec = [...answers, ...additionals]
+        .find(r => r.type === 'A' && r.name === fullName);
+      if (aRec) finish(null, aRec.data);
+    });
+
+    m.on('error', (err) => finish(err));
+
+    m.query({ questions: [{ name: fullName, type: 'A' }] });
+  });
+}
+
+/**
+ * Discover LAN devices that expose SSH, using mDNS service browsing.
+ * Probes _ssh._tcp.local and _sftp-ssh._tcp.local PTR records, and
+ * passively collects any .local A records seen in responses/additionals.
+ */
+function discoverDevices(timeoutMs = 3500) {
+  return new Promise((resolve) => {
+    const m = mDNS();
+    // hostname → { hostname, ip, port, label }
+    const seen = new Map();
+
+    const upsert = (hostname, ip, port, label) => {
+      if (!hostname) return;
+      const prev = seen.get(hostname) || {};
+      seen.set(hostname, {
+        hostname,
+        ip:    ip    || prev.ip,
+        port:  port  || prev.port  || 22,
+        label: label || prev.label || hostname.replace(/\.local$/, ''),
+      });
+    };
+
+    m.on('response', ({ answers = [], additionals = [] }) => {
+      const all = [...answers, ...additionals];
+
+      // Index all A records by name for quick lookup
+      const aByName = {};
+      for (const r of all) {
+        if (r.type === 'A') aByName[r.name] = r.data;
+      }
+
+      // Walk PTR → SRV → A chains (devices that advertise SSH via DNS-SD)
+      for (const ptr of all.filter(r => r.type === 'PTR')) {
+        if (!ptr.name.endsWith('._tcp.local')) continue;
+        const svcInstance = ptr.data;                          // e.g. "pi@raspberrypi._ssh._tcp.local"
+        const srv = all.find(r => r.type === 'SRV' && r.name === svcInstance);
+        if (srv) {
+          const target = srv.data.target;                      // e.g. "raspberrypi.local"
+          const ip = aByName[target];
+          const label = svcInstance
+            .replace(/\._ssh\._tcp\.local$/,      '')
+            .replace(/\._sftp-ssh\._tcp\.local$/, '');
+          upsert(target, ip, srv.data.port, label);
+        }
+      }
+
+      // Passively collect any .local A records (devices that DON'T use DNS-SD
+      // but whose traffic we happen to see during the scan window)
+      for (const [name, ip] of Object.entries(aByName)) {
+        if (name.endsWith('.local')) upsert(name, ip, 22, null);
+      }
+    });
+
+    m.on('error', () => {});   // non-fatal during discovery
+
+    // Probe SSH service records; other mDNS traffic fills in the rest
+    m.query({
+      questions: [
+        { name: '_ssh._tcp.local',      type: 'PTR' },
+        { name: '_sftp-ssh._tcp.local', type: 'PTR' },
+      ],
+    });
+
+    setTimeout(() => {
+      try { m.destroy(); } catch {}
+      const results = [...seen.values()]
+        .filter(d => d.ip)                               // must have a resolved IP
+        .sort((a, b) => a.label.localeCompare(b.label));
+      resolve(results);
+    }, timeoutMs);
+  });
+}
+
+// ─── REST: device discovery ───────────────────────────────────────────────────
+
+app.get('/api/discover', async (_req, res) => {
+  try {
+    const devices = await discoverDevices();
+    res.json({ ok: true, devices });
+  } catch (err) {
+    res.json({ ok: false, devices: [], error: err.message });
+  }
+});
+
+
 
 wss.on('connection', (ws, req) => {
   const clientIP = (
@@ -183,69 +319,88 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        sshConn = new Client();
-
-        sshConn.on('ready', () => {
-          sshConn.shell(
-            {
-              term: 'xterm-256color',
-              rows: Math.max(1, parseInt(rows, 10) || 24),
-              cols: Math.max(1, parseInt(cols, 10) || 80),
-            },
-            (err, stream) => {
-              if (err) {
-                send({ type: 'error', message: `Shell error: ${err.message}` });
-                cleanup();
-                return;
-              }
-
-              shellStream = stream;
-              connected   = true;
-
-              send({ type: 'connected', sessionId: crypto.randomBytes(8).toString('hex') });
-
-              // SSH → browser
-              stream.on('data', (chunk) => {
-                send({ type: 'data', data: chunk.toString('base64') });
-              });
-              stream.stderr?.on('data', (chunk) => {
-                send({ type: 'data', data: Buffer.from(chunk).toString('base64') });
-              });
-
-              stream.on('close', () => {
-                send({ type: 'disconnected', message: 'Remote session closed.' });
-                cleanup();
-              });
+        // Async IIFE — needed so we can await mDNS resolution before SSH
+        (async () => {
+          // ── mDNS resolution ──────────────────────────────────────────────
+          let resolvedHost = host;
+          if (needsMdns(host)) {
+            const label = host.endsWith('.local') ? host : `${host}.local`;
+            send({ type: 'mdns_resolving', hostname: label });
+            try {
+              resolvedHost = await resolveMdns(host);
+              send({ type: 'mdns_resolved', hostname: label, ip: resolvedHost });
+            } catch (err) {
+              send({ type: 'error', message: err.message });
+              return;
             }
-          );
-        });
+          }
 
-        sshConn.on('error', (err) => {
-          send({ type: 'error', message: `SSH: ${err.message}` });
-          cleanup();
-        });
+          // ── SSH connection ───────────────────────────────────────────────
+          sshConn = new Client();
 
-        // Support keyboard-interactive auth (sudo prompts etc.)
-        sshConn.on('keyboard-interactive', (_name, _instr, _lang, prompts, finish) => {
-          finish(prompts.map(() => password));
-        });
+          sshConn.on('ready', () => {
+            sshConn.shell(
+              {
+                term: 'xterm-256color',
+                rows: Math.max(1, parseInt(rows, 10) || 24),
+                cols: Math.max(1, parseInt(cols, 10) || 80),
+              },
+              (err, stream) => {
+                if (err) {
+                  send({ type: 'error', message: `Shell error: ${err.message}` });
+                  cleanup();
+                  return;
+                }
 
-        send({ type: 'status', message: `Connecting to ${username}@${host}:${sshPort}…` });
+                shellStream = stream;
+                connected   = true;
 
-        try {
-          sshConn.connect({
-            host,
-            port:     sshPort,
-            username,
-            password,
-            tryKeyboard:      true,
-            readyTimeout:     SSH_TIMEOUT,
-            keepaliveInterval: KEEPALIVE_MS,
+                send({ type: 'connected', sessionId: crypto.randomBytes(8).toString('hex') });
+
+                // SSH → browser
+                stream.on('data', (chunk) => {
+                  send({ type: 'data', data: chunk.toString('base64') });
+                });
+                stream.stderr?.on('data', (chunk) => {
+                  send({ type: 'data', data: Buffer.from(chunk).toString('base64') });
+                });
+
+                stream.on('close', () => {
+                  send({ type: 'disconnected', message: 'Remote session closed.' });
+                  cleanup();
+                });
+              }
+            );
           });
-        } catch (err) {
-          send({ type: 'error', message: `Init error: ${err.message}` });
-          cleanup();
-        }
+
+          sshConn.on('error', (err) => {
+            send({ type: 'error', message: `SSH: ${err.message}` });
+            cleanup();
+          });
+
+          // Support keyboard-interactive auth (sudo prompts, etc.)
+          sshConn.on('keyboard-interactive', (_name, _instr, _lang, prompts, finish) => {
+            finish(prompts.map(() => password));
+          });
+
+          send({ type: 'status', message: `Connecting to ${username}@${resolvedHost}:${sshPort}…` });
+
+          try {
+            sshConn.connect({
+              host:              resolvedHost,
+              port:              sshPort,
+              username,
+              password,
+              tryKeyboard:       true,
+              readyTimeout:      SSH_TIMEOUT,
+              keepaliveInterval: KEEPALIVE_MS,
+            });
+          } catch (err) {
+            send({ type: 'error', message: `Init error: ${err.message}` });
+            cleanup();
+          }
+        })();
+
         break;
       }
 
