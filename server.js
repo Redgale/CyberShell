@@ -6,7 +6,7 @@
 'use strict';
 
 const express   = require('express');
-const http     = require('http');
+const https     = require('https');
 const WebSocket = require('ws');
 const { Client } = require('ssh2');
 const mDNS      = require('multicast-dns');
